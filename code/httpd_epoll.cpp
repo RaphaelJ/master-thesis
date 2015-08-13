@@ -14,14 +14,20 @@
 
 #include <arpa/inet.h>          // htons()
 #include <dirent.h>             // struct dirent, opendir(), readdir()
+#include <fcntl.h>              // fcntl()
+#include <pthread.h>            // pthread_*
 #include <sys/epoll.h>          // epoll_*
+#include <sys/sendfile.h>       // sendfile()
 #include <sys/socket.h>         // accept(), bind, listen(), recv(), send()
 #include <sys/stat.h>           // struct stat, stat()
 #include <sys/uio.h>            // writev()
 #include <unistd.h>             // close()
 
+
 const size_t    MAX_EVENTS      = 1024;
 const int       LISTEN_BACKLOG  = 1024;
+
+#define PRELOAD_FILE_CONTENT
 
 using namespace std;
 
@@ -52,7 +58,7 @@ using namespace std;
 struct args_t {
     uint16_t                        tcp_port;
     char                            *root_dir;
-    size_t                          n_workers;
+    int                             n_workers;
 };
 
 // Type used to index file by their filename. Different from 'std::string', so
@@ -94,9 +100,21 @@ struct equal_to<filename_t> {
 
 // Served file and its content.
 struct file_t {
-    char                            *content;
+    #ifdef PRELOAD_FILE_CONTENT
+        char                            *content;
+    #else
+        int                             file_desc;
+    #endif /* PRELOAD_FILE_CONTENT */
     size_t                          content_len;
 };
+
+struct worker_data_t {
+    unordered_map<filename_t, file_t>   *files;
+    uint16_t                            tcp_port;
+};
+
+// Function executed by each worker threads (called by 'pthread_create()').
+static void *_worker_runner(void *files_void);
 
 static void _print_usage(char **argv);
 
@@ -139,6 +157,28 @@ int main(int argc, char **argv)
     _preload_files(&files, args.root_dir);
 
     //
+    // Starts the workers
+    //
+    worker_data_t worker_data { &files, args.tcp_port };
+
+    for (int i = 0; i < args.n_workers - 1; i++) {
+        pthread_t thread_id;
+        pthread_create(&thread_id, nullptr, _worker_runner, &worker_data);
+    }
+
+    // Starts the last worker in the current process.
+    _worker_runner(&worker_data);
+
+    return 0;
+}
+
+static void *_worker_runner(void *worker_data_void)
+{
+    worker_data_t *worker_data = (worker_data_t *) worker_data_void;
+
+    printf("Thread started\n");
+
+    //
     // Sets up the server socket.
     //
 
@@ -148,14 +188,19 @@ int main(int argc, char **argv)
 
     // Avoid "address already in use" when the listen address is still in
     // TIME-WAIT.
+    int one = 1;
     if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof (one)))
         DIE("setsockopt(SO_REUSEADDR)");
 
+    // Specifies that multiple process/threads can listen for new connections on
+    // this port.
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof (one)))
+        DIE("setsockopt(SO_REUSEPORT)");
 
     struct sockaddr_in listen_addr = { 0 };
     listen_addr.sin_family      = AF_INET;
     listen_addr.sin_addr.s_addr = INADDR_ANY;
-    listen_addr.sin_port        = htons(args.tcp_port);
+    listen_addr.sin_port        = htons(worker_data->tcp_port);
 
     if (bind(
         listen_sock, (sockaddr *) &listen_addr, sizeof (listen_addr)
@@ -165,11 +210,6 @@ int main(int argc, char **argv)
     if (listen(listen_sock, LISTEN_BACKLOG) == -1)
         DIE("listen()");
 
-    // Specifies that multiple process/threads can listen for new connections on
-    // this port.
-    int one = 1;
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof (one)))
-        DIE("setsockopt(SO_REUSEPORT)");
     // Creates an epoll for all the events on the sockets.
     int epoll;
     if ((epoll = epoll_create(MAX_EVENTS)) == -1)
@@ -208,6 +248,14 @@ int main(int argc, char **argv)
 
                 DEBUG("New client");
 
+                // Sets the socket to be non-blocking
+                int flags;
+                if ((flags = fcntl(client_sock, F_GETFL, 0)) == -1)
+                    DIE("fcntl(F_GETFL)");
+
+                if (fcntl(client_sock, F_SETFL, flags | O_NONBLOCK)  == -1)
+                    DIE("fcntl(F_SETFL)");
+
                 // Sets epoll to listen for new data on the client socket.
                 struct epoll_event event;
                 event.events    = EPOLLIN;
@@ -218,7 +266,7 @@ int main(int argc, char **argv)
                 // Event on a client socket.
 
                 char buffer[1024];
-                size_t n = recv(events[i].data.fd, buffer, sizeof (buffer), 0);
+                int n = recv(events[i].data.fd, buffer, sizeof (buffer), 0);
 
                 if (n == -1)
                     DIE("recv()");
@@ -228,13 +276,13 @@ int main(int argc, char **argv)
                         DIE("epoll_ctl(DEL, client_sock)");
                 } else {
                     // New data.
-                    _on_received_data(&files, sock, buffer, n);
+                    _on_received_data(worker_data->files, sock, buffer, n);
                 }
             }
         }
     }
 
-    return 0;
+    return nullptr;
 }
 
 static void _print_usage(char **argv)
@@ -296,17 +344,20 @@ static void _preload_files(
         size_t content_size = ftell(file);
         fseek(file, 0, SEEK_SET);
 
-        // Reads the file content
+        #ifdef PRELOAD_FILE_CONTENT
+            // Reads the file content
 
-        char *content = new char[content_size + 1];
-        size_t read = fread(content, 1, content_size, file);
+            char *content = new char[content_size + 1];
+            size_t read = fread(content, 1, content_size, file);
 
-        if (read != content_size)
-            DIE("Unable to read a file %zu %zu", read, content_size);
+            if (read != content_size)
+                DIE("Unable to read a file %zu %zu", read, content_size);
 
-        content[content_size] = '\0';
-
-        fclose(file);
+            content[content_size] = '\0';
+            fclose(file);
+        #else
+            int content = open(filepath, O_RDONLY);
+        #endif /* PRELOAD_FILE_CONTENT */
 
         file_t entry = { content, content_size };
 
@@ -397,16 +448,21 @@ void _respond_with_200(int sock, const file_t *file)
     char header_buffer[header_len + 1];
     snprintf(header_buffer, sizeof (header_buffer), header, file->content_len);
 
-    // Sends the header and the file.
-    struct iovec iovs[2] = { 0 };
+    #ifdef PRELOAD_FILE_CONTENT
+        // Sends the header and the file.
+        struct iovec iovs[2] = { 0 };
 
-    iovs[0].iov_base = header_buffer;
-    iovs[0].iov_len  = header_len;
+        iovs[0].iov_base = header_buffer;
+        iovs[0].iov_len  = header_len;
 
-    iovs[1].iov_base = file->content;
-    iovs[1].iov_len  = file->content_len;
+        iovs[1].iov_base = file->content;
+        iovs[1].iov_len  = file->content_len;
 
-    writev(sock, iovs, 2);
+        writev(sock, iovs, 2);
+    #else
+        send(sock, header_buffer, header_len, 0);
+        sendfile(sock, file->file_desc, nullptr, file->content_len);
+    #endif /* PRELOAD_FILE_CONTENT */
 }
 
 #define RESPOND_WITH_CONTENT(CONTENT)                                          \
