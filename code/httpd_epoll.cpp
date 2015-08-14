@@ -274,6 +274,7 @@ static void *_worker_runner(void *worker_data_void)
                     // Connection closed
                     if (epoll_ctl(epoll, EPOLL_CTL_DEL, sock, nullptr))
                         DIE("epoll_ctl(DEL, client_sock)");
+                    close(sock);
                 } else {
                     // New data.
                     _on_received_data(worker_data->files, sock, buffer, n);
